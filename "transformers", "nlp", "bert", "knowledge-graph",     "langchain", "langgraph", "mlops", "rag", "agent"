@@ -1,0 +1,388 @@
+# github_sourcer_excel.py
+"""
+GitHub sourcer (Europe + 2024+):
+- Searches Python repos matching topic/keyword chunks (obey GitHub boolean limits).
+- Keeps owners whose profile location is European OR blank.
+- Excludes rows with clear non-Europe locations (United States, Beijing, Austin, Vancouver, etc.).
+- Drops repos whose last push/update is before 2024-01-01.
+- Exports Excel with clickable links + repo info (name, link, last update, description).
+
+Requires: requests, pandas, openpyxl
+Token:    set env var GITHUB_TOKEN or provide token_1.py with GITHUB_TOKEN_2
+"""
+
+import os
+import re
+import time
+import typing as t
+from datetime import datetime, timezone
+from urllib.parse import quote_plus, urlparse
+from pathlib import Path
+
+import requests
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font
+
+# ---------------- Config ----------------
+GITHUB_API = "https://api.github.com"
+
+LANGUAGE = "Python"
+TOPICS = [
+    "transformers", "nlp", "bert", "knowledge-graph",
+    "langchain", "langgraph", "mlops", "rag", "agent"
+]
+KEYWORDS = [
+    "transformers", "nlp", "bert", "knowledge graph",
+    "langchain", "langgraph", "mlops", "rag", "agent"
+]
+
+# Only repos active in/after 2024:
+EXTRA_QUALIFIERS = "archived:false is:public pushed:>=2024-01-01"
+
+# GitHub boolean-operator limit -> chunk ORs
+MAX_OR_TERMS_PER_QUERY = 6
+
+# Owners we include
+INCLUDE_ORGS = False          # keep only Users
+KEEP_UNKNOWN_LOCATION = True  # keep blank/unknown locations
+
+# Positive Europe tokens (countries + major cities/regions)
+EURO_TOKENS = {
+    "albania","andorra","armenia","austria","azerbaijan","belarus","belgium","bosnia",
+    "bulgaria","croatia","cyprus","czech","denmark","estonia","finland","france","germany",
+    "georgia","greece","hungary","iceland","ireland","italy","kosovo","latvia","liechtenstein",
+    "lithuania","luxembourg","malta","moldova","monaco","montenegro","netherlands","north macedonia",
+    "norway","poland","portugal","romania","russia","san marino","serbia","slovakia","slovenia",
+    "spain","sweden","switzerland","turkey","türkiye","ukraine","united kingdom","great britain",
+    "england","scotland","wales","northern ireland","vatican","holy see",
+    "london","paris","berlin","munich","münchen","hamburg","frankfurt","stuttgart","cologne","köln",
+    "madrid","barcelona","valencia","lisbon","porto","rome","milano","milan","naples","napoli","turin","torino",
+    "athens","thessaloniki","amsterdam","rotterdam","the hague","den haag","brussels","antwerp","gent","ghent",
+    "vienna","budapest","prague","warsaw","krakow","kraków","wrocław","bucharest","sofia","copenhagen",
+    "oslo","bergen","stockholm","gothenburg","göteborg","helsinki","tallinn","riga","vilnius","luxembourg city",
+    "dublin","belfast","edinburgh","cardiff","zurich","zürich","geneva","lausanne","basel","ljubljana","zagreb",
+    "sarajevo","belgrade","bratislava","chisinau","chișinău","yerevan","tbilisi","ankara","istanbul","izmir",
+    "kyiv","kiev","odessa","odesa","larnaca","nicosia","gibraltar","faroe","guernsey","jersey","isle of man",
+}
+
+# Explicit non-Europe hints to exclude (countries + big cities/states)
+NON_EU_HINTS = {
+    # North America
+    "united states","usa","canada","mexico","austin","tx","texas","california","ca","new york","ny",
+    "los angeles","san francisco","seattle","boston","chicago","denver","miami","vancouver","toronto",
+    "montreal","ottawa",
+    # East Asia
+    "china","beijing","shenzhen","shanghai","guangzhou","hong kong","taiwan","taipei","hualien",
+    "japan","tokyo","osaka","yokohama","nagoya","korea","south korea","seoul","busan",
+    # SE/SA/ME/Africa/Oceania
+    "singapore","malaysia","kuala lumpur","thailand","bangkok","vietnam","hanoi","ho chi minh",
+    "india","delhi","new delhi","mumbai","pune","bengaluru","bangalore","hyderabad","chennai",
+    "israel","tel aviv","jerusalem","haifa",
+    "egypt","cairo","morocco","casablanca","rabat","tunisia","tunis","algeria","algiers",
+    "brazil","rio de janeiro","sao paulo","argentina","buenos aires","chile","santiago","peru","lima",
+    "colombia","bogota","bogotá","medellin","méxico",
+    "south africa","cape town","johannesburg","nigeria","lagos","kenya","nairobi",
+    "australia","sydney","melbourne","perth","brisbane","new zealand","auckland","wellington",
+    "uae","dubai","abu dhabi","riyadh","saudi",
+}
+
+DATE_CUTOFF = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+MAX_REPOS = 500
+PER_PAGE = 100
+TIMEOUT = 20
+DEFAULT_XLSX = "github_users_python_topics.xlsx"
+
+# ---------------- Token -----------------
+try:
+    from token_1 import GITHUB_TOKEN_2
+except Exception:
+    GITHUB_TOKEN_2 = None
+TOKEN = os.getenv("GITHUB_TOKEN") or GITHUB_TOKEN_2
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "github-sourcer-script/3.2"
+})
+if TOKEN:
+    SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
+
+
+# ---------------- Helpers ----------------
+def safe_output_path(filename: str) -> Path:
+    p = Path(__file__).with_name(filename)
+    try:
+        p.touch(exist_ok=True)
+        return p
+    except PermissionError:
+        return p.with_name(p.stem + "_new" + p.suffix)
+
+OUTPUT_XLSX = safe_output_path(DEFAULT_XLSX)
+
+def chunked(lst: list[str], n: int) -> t.Iterable[list[str]]:
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def build_topic_queries(language: str, topics: list[str], extra_qualifiers: str = "") -> list[str]:
+    queries = []
+    for group in chunked(topics, MAX_OR_TERMS_PER_QUERY):
+        topics_expr = " OR ".join(f"topic:{t}" for t in group)
+        q = f'language:{language} ({topics_expr})'
+        if extra_qualifiers:
+            q += f" {extra_qualifiers}"
+        queries.append(q)
+    return queries
+
+def build_keyword_queries(language: str, keywords: list[str], extra_qualifiers: str = "") -> list[str]:
+    queries = []
+    for group in chunked(keywords, MAX_OR_TERMS_PER_QUERY):
+        parts = [f'"{kw}"' if " " in kw else kw for kw in group]
+        kw_expr = " OR ".join(parts)
+        q = f'language:{language} ({kw_expr}) in:name,description,readme'
+        if extra_qualifiers:
+            q += f" {extra_qualifiers}"
+        queries.append(q)
+    return queries
+
+def get(url: str) -> requests.Response:
+    resp = SESSION.get(url, timeout=TIMEOUT)
+    if resp.status_code == 403:
+        reset = resp.headers.get("X-RateLimit-Reset")
+        if reset:
+            wait_for = max(0, int(reset) - int(time.time())) + 2
+            print(f"Rate limit reached. Sleeping {wait_for}s...")
+            time.sleep(wait_for)
+            resp = SESSION.get(url, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp
+
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    url = url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        return url if urlparse(url).netloc else ""
+    except Exception:
+        return ""
+
+def extract_first_linkedin(*fields: str) -> str:
+    for field in fields:
+        if not field:
+            continue
+        urls = re.findall(r"(https?://[^\s)]+)", field, flags=re.IGNORECASE)
+        for u in urls:
+            if "linkedin.com" in u.lower():
+                return normalize_url(u)
+        if "linkedin.com" in field.lower():
+            idx = field.lower().find("linkedin.com")
+            candidate = field[idx:].split()[0].strip().rstrip(".,);")
+            return normalize_url(candidate)
+    return ""
+
+def urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = re.findall(r"(https?://[^\s)]+)", text)
+    return [normalize_url(u) for u in urls if normalize_url(u)]
+
+def split_name(full_name: str) -> t.Tuple[str, str]:
+    if not full_name:
+        return "", ""
+    parts = [p.strip() for p in full_name.split() if p.strip()]
+    if len(parts) < 2:
+        return (parts[0], "") if parts else ("", "")
+    return parts[0], parts[-1]
+
+def parse_iso_datetime(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def is_europe_or_blank(loc_text: str) -> bool:
+    """True if blank, or clearly European; False if clear non-Europe; otherwise False."""
+    if not loc_text or not loc_text.strip():
+        return KEEP_UNKNOWN_LOCATION  # keep blanks per your rule
+    s = loc_text.lower()
+    s = s.replace(",", " ").replace("/", " ").replace("|", " ")
+    # explicit non-Europe words take precedence
+    for bad in NON_EU_HINTS:
+        if bad in s:
+            return False
+    # any Europe token qualifies
+    for ok in EURO_TOKENS:
+        if ok in s:
+            return True
+    # if we can't tell, drop (conservative)
+    return False
+
+
+# ---------------- Data fetch ----------------
+def search_repositories_single(query: str, per_page: int = PER_PAGE) -> t.Iterable[dict]:
+    page = 1
+    while True:
+        qp = quote_plus(query)
+        url = (f"{GITHUB_API}/search/repositories?q={qp}"
+               f"&per_page={per_page}&page={page}&sort=best-match&order=desc")
+        data = get(url).json()
+        items = data.get("items") or []
+        if not items:
+            break
+        for repo in items:
+            yield repo
+        page += 1
+
+def search_repositories_multi(queries: list[str], max_repos: int = MAX_REPOS, per_page: int = PER_PAGE) -> t.Iterable[dict]:
+    fetched = 0
+    for q in queries:
+        print(f"Query: {q}")
+        for repo in search_repositories_single(q, per_page):
+            # extra guard on repo freshness
+            pushed_at = parse_iso_datetime(repo.get("pushed_at") or repo.get("updated_at") or repo.get("created_at") or "")
+            if pushed_at and pushed_at < DATE_CUTOFF:
+                continue
+            yield repo
+            fetched += 1
+            if fetched >= max_repos:
+                return
+
+def fetch_user_or_org(login: str) -> dict:
+    try:
+        return get(f"{GITHUB_API}/users/{login}").json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {}
+        raise
+
+
+# ---------------- Main ----------------
+def main():
+    queries = build_topic_queries(LANGUAGE, TOPICS, EXTRA_QUALIFIERS)
+    if KEYWORDS:
+        queries += build_keyword_queries(LANGUAGE, KEYWORDS, EXTRA_QUALIFIERS)
+
+    print("Constructed queries:")
+    for q in queries:
+        print("  -", q)
+    print()
+
+    unique_logins: set[str] = set()
+    first_repo_by_owner: dict[str, dict] = {}
+
+    for repo in search_repositories_multi(queries, MAX_REPOS, PER_PAGE):
+        owner = repo.get("owner") or {}
+        if not INCLUDE_ORGS and owner.get("type") != "User":
+            continue
+        login = owner.get("login")
+        if not login:
+            continue
+        if login not in unique_logins:
+            unique_logins.add(login)
+            first_repo_by_owner[login] = {
+                "name": repo.get("full_name") or repo.get("name") or "",
+                "html_url": repo.get("html_url") or "",
+                "updated_at": repo.get("pushed_at") or repo.get("updated_at") or repo.get("created_at") or "",
+                "description": repo.get("description") or ""
+            }
+
+    print(f"Unique potential owners to fetch: {len(unique_logins)}")
+
+    owners: dict[str, dict] = {}
+    for login in sorted(unique_logins):
+        user = fetch_user_or_org(login)
+        if user:
+            owners[login] = user
+
+    # --- Europe filter on owner location ---
+    filtered_logins: list[str] = []
+    for login, user in owners.items():
+        loc = (user.get("location") or "").strip()
+        if is_europe_or_blank(loc):
+            filtered_logins.append(login)
+    print(f"Owners after Europe filter: {len(filtered_logins)}")
+
+    # --- Write Excel ---
+    rows = []
+    for login in sorted(filtered_logins, key=str.lower):
+        user = owners[login]
+        full_name = (user.get("name") or "").strip()
+        first, surname = split_name(full_name)
+        complete_name = f"{first} {surname}".strip()
+
+        location = (user.get("location") or "").strip()
+        html_url = normalize_url(user.get("html_url") or f"https://github.com/{login}")
+
+        blog_raw = (user.get("blog") or "").strip()
+        blog = normalize_url(blog_raw)
+        bio = (user.get("bio") or "").strip()
+        email = (user.get("email") or "").strip()
+        twitter_user = (user.get("twitter_username") or "").strip()
+        twitter = normalize_url(f"https://twitter.com/{twitter_user}") if twitter_user else ""
+
+        linkedin = extract_first_linkedin(blog_raw, bio)
+        extra_links_list = urls_from_text(bio)
+        extra_links = "; ".join(extra_links_list)
+
+        repo_info = first_repo_by_owner.get(login, {}) or {}
+        # last safety on repo freshness
+        pushed_at = parse_iso_datetime(repo_info.get("updated_at") or "")
+        if pushed_at and pushed_at < DATE_CUTOFF:
+            continue
+
+        rows.append({
+            "login": login,
+            "complete_name": complete_name,
+            "location": location,
+            "profile_url": html_url,
+            "repo_name": repo_info.get("name", ""),
+            "repo_url": normalize_url(repo_info.get("html_url", "")),
+            "repo_updated_at": repo_info.get("updated_at", ""),
+            "repo_description": repo_info.get("description", ""),
+            "linkedin": linkedin,
+            "email": email,
+            "twitter": twitter,
+            "blog": blog,
+            "extra_links": extra_links
+        })
+
+    df = pd.DataFrame(rows, columns=[
+        "login","complete_name","location",
+        "profile_url","repo_name","repo_url","repo_updated_at","repo_description",
+        "linkedin","email","twitter","blog","extra_links"
+    ]).fillna("")
+
+    out = safe_output_path(DEFAULT_XLSX)
+    df.to_excel(out, index=False)
+
+    # clickable links
+    wb = load_workbook(out)
+    ws = wb.active
+    headers = {c.value: i for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)), start=1)}
+    link_cols = {"profile_url":"GitHub","repo_url":"Repo","linkedin":"LinkedIn","twitter":"Twitter","blog":"Website","extra_links":"Extra"}
+    for r in range(2, ws.max_row + 1):
+        for k, label in link_cols.items():
+            cidx = headers.get(k)
+            if not cidx: continue
+            cell = ws.cell(row=r, column=cidx)
+            val = (cell.value or "").strip()
+            if not val: continue
+            url = val.split(";")[0].strip()
+            if url.lower().startswith(("http://","https://")):
+                cell.value = label
+                cell.hyperlink = url
+                cell.font = Font(color="0563C1", underline="single")
+    wb.save(out)
+    print(f"Done: {out.resolve()} (rows: {len(df)})")
+    print("If you still see Austin/Beijing/etc., confirm the 'location' text on their profile and we can add new NON_EU_HINTS.")
+    
+if __name__ == "__main__":
+    try:
+        main()
+    except requests.HTTPError as e:
+        print("HTTP error:", e)
+    except Exception as e:
+        print("Error:", e)
